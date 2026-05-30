@@ -32,7 +32,7 @@ EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGO = os.environ.get("JWT_ALGO", "HS256")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -1307,7 +1307,7 @@ async def meditations(user=Depends(current_user)):
 # ============================================================
 # GEMINI LIVE — Realtime voice WebSocket relay
 # ============================================================
-gemini_live_client = google_genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Gemini Live client is instantiated per-WS connection (see voice_websocket below)
 
 
 async def build_voice_system_prompt(user_id: str) -> str:
@@ -1348,154 +1348,150 @@ def _user_from_token(token: str) -> Optional[str]:
 @app.websocket("/api/voice/ws")
 async def voice_websocket(websocket: WebSocket, token: str = Query(...)):
     """
-    Production-grade Gemini Live API relay.
+    Gemini Live API relay — uses Fix-It Gemini's proven implementation pattern,
+    with MindSphere's mental wellness system prompt.
 
     Client → Server messages (JSON):
-      {"type":"audio","data": base64 PCM16 LE @ 16kHz mono}
-      {"type":"text","text": "..."}                 — send text input turn
-      {"type":"activity_start"}                     — user started speaking (interrupt)
-      {"type":"activity_end"}                       — user stopped speaking (end of turn)
-      {"type":"ping"}                               — keepalive
+      {"type":"audio_in","chunk": base64 PCM16 LE @ 16kHz mono}
+      {"type":"text","text": "..."}                — send text input turn
+      {"type":"stop"}                              — end session
+      {"type":"ping"}                              — keepalive
 
     Server → Client messages (JSON):
-      {"type":"audio","data": base64 PCM16 LE @ 24kHz mono}
-      {"type":"text","text": "...", "role":"assistant"|"user"}   — transcript
+      {"type":"audio_out","chunk": base64 PCM16 LE @ 24kHz mono}
+      {"type":"transcript","text": "...", "role":"model"|"user"}
+      {"type":"status","text":"connecting"|"connected"}
       {"type":"interrupted"}
       {"type":"turn_complete"}
-      {"type":"setup_complete"}
-      {"type":"error","error":"..."}
+      {"type":"error","text":"..."}
     """
     await websocket.accept()
     user_id = _user_from_token(token)
-    if not user_id or not gemini_live_client:
-        await websocket.send_json({"type": "error", "error": "auth or gemini key missing"})
+    if not user_id:
+        await websocket.send_text(json.dumps({"type": "error", "text": "auth missing"}))
+        await websocket.close()
+        return
+    if not GEMINI_API_KEY:
+        await websocket.send_text(json.dumps({"type": "error", "text": "GEMINI_API_KEY missing"}))
+        await websocket.close()
+        return
+
+    try:
+        from google import genai as _genai
+        from google.genai import types as gt
+    except Exception as e:
+        await websocket.send_text(json.dumps({"type": "error", "text": f"google-genai missing: {e}"}))
         await websocket.close()
         return
 
     system_prompt = await build_voice_system_prompt(user_id)
-
-    # Live API config — flash native audio for low latency
+    client_live = _genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1beta"})
     config = {
         "response_modalities": ["AUDIO"],
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "input_audio_transcription": {},
-        "output_audio_transcription": {},
-        "realtime_input_config": {
-            # Server-side VAD by default; client also drives activity_start/end
-            "automatic_activity_detection": {"disabled": False},
-        },
-        "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}},
-        },
+        "system_instruction": system_prompt,
     }
 
+    await websocket.send_text(json.dumps({"type": "status", "text": "connecting"}))
     log.info("voice ws: user=%s starting Gemini Live (model=%s)", user_id, GEMINI_LIVE_MODEL)
 
     try:
-        async with gemini_live_client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config) as session:
-            await websocket.send_json({"type": "setup_complete"})
+        async with client_live.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config) as session:
+            await websocket.send_text(json.dumps({"type": "status", "text": "connected"}))
 
-            # --- pump 1: client → gemini ---
-            async def client_to_gemini():
+            stop_event = asyncio.Event()
+
+            async def browser_to_gemini():
                 try:
-                    while True:
+                    while not stop_event.is_set():
                         raw = await websocket.receive_text()
                         try:
                             msg = json.loads(raw)
                         except Exception:
                             continue
                         t = msg.get("type")
-                        if t == "audio":
-                            b64 = msg.get("data") or ""
-                            if not b64:
-                                continue
+                        if t == "audio_in":
                             try:
-                                audio_bytes = base64.b64decode(b64)
-                            except Exception:
-                                continue
-                            await session.send_realtime_input(
-                                audio=gtypes.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
-                            )
+                                audio_bytes = base64.b64decode(msg.get("chunk", ""))
+                                if audio_bytes:
+                                    await session.send_realtime_input(
+                                        audio=gt.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
+                                    )
+                            except Exception as e:
+                                log.debug("audio_in dropped: %s", e)
                         elif t == "text":
-                            text = (msg.get("text") or "").strip()
-                            if text:
+                            try:
                                 await session.send_client_content(
-                                    turns=[{"role": "user", "parts": [{"text": text}]}],
+                                    turns=gt.Content(role="user", parts=[gt.Part(text=msg.get("text", ""))]),
                                     turn_complete=True,
                                 )
-                        elif t == "activity_start":
-                            try: await session.send_realtime_input(activity_start=gtypes.ActivityStart())
-                            except Exception: pass
-                        elif t == "activity_end":
-                            try: await session.send_realtime_input(activity_end=gtypes.ActivityEnd())
-                            except Exception: pass
+                            except Exception as e:
+                                log.warning("text send failed: %s", e)
                         elif t == "ping":
-                            await websocket.send_json({"type": "pong"})
+                            try:
+                                await websocket.send_text(json.dumps({"type": "pong"}))
+                            except Exception:
+                                pass
+                        elif t == "stop":
+                            stop_event.set()
+                            break
                 except WebSocketDisconnect:
-                    raise
+                    log.info("voice ws: browser disconnected user=%s", user_id)
+                    stop_event.set()
                 except Exception as e:
-                    log.exception("client_to_gemini error: %s", e)
-                    raise
+                    log.warning("browser_to_gemini error: %s", e)
+                    stop_event.set()
 
-            # --- pump 2: gemini → client ---
-            async def gemini_to_client():
+            async def gemini_to_browser():
                 try:
-                    async for response in session.receive():
-                        # Audio data + transcripts arrive via server_content
-                        sc = getattr(response, "server_content", None)
-                        if sc is None:
-                            continue
-                        # interruption signal
-                        if getattr(sc, "interrupted", False):
-                            await websocket.send_json({"type": "interrupted"})
-                        # input transcription
-                        in_tx = getattr(sc, "input_transcription", None)
-                        if in_tx and getattr(in_tx, "text", None):
-                            await websocket.send_json({"type": "text", "role": "user", "text": in_tx.text})
-                        # output transcription
-                        out_tx = getattr(sc, "output_transcription", None)
-                        if out_tx and getattr(out_tx, "text", None):
-                            await websocket.send_json({"type": "text", "role": "assistant", "text": out_tx.text})
-                        # audio output (model_turn.parts[].inline_data.data)
-                        mt = getattr(sc, "model_turn", None)
-                        if mt and getattr(mt, "parts", None):
-                            for part in mt.parts:
-                                inline = getattr(part, "inline_data", None)
-                                if inline and getattr(inline, "data", None):
-                                    b64 = base64.b64encode(inline.data).decode("ascii")
-                                    await websocket.send_json({"type": "audio", "data": b64})
-                                txt = getattr(part, "text", None)
-                                if txt:
-                                    await websocket.send_json({"type": "text", "role": "assistant", "text": txt})
-                        if getattr(sc, "turn_complete", False):
-                            await websocket.send_json({"type": "turn_complete"})
-                except WebSocketDisconnect:
-                    raise
+                    while not stop_event.is_set():
+                        async for response in session.receive():
+                            if stop_event.is_set():
+                                return
+                            if getattr(response, "data", None):
+                                audio_b64 = base64.b64encode(response.data).decode("ascii")
+                                try:
+                                    await websocket.send_text(json.dumps({"type": "audio_out", "chunk": audio_b64}))
+                                except Exception:
+                                    stop_event.set(); return
+                            if getattr(response, "text", None):
+                                try:
+                                    await websocket.send_text(json.dumps({"type": "transcript", "text": response.text, "role": "model"}))
+                                except Exception:
+                                    stop_event.set(); return
+                            sc = getattr(response, "server_content", None)
+                            if sc is not None:
+                                if getattr(sc, "interrupted", False):
+                                    try: await websocket.send_text(json.dumps({"type": "interrupted"}))
+                                    except Exception: pass
+                                if getattr(sc, "turn_complete", False):
+                                    try: await websocket.send_text(json.dumps({"type": "turn_complete"}))
+                                    except Exception: pass
+                        await asyncio.sleep(0.05)
                 except Exception as e:
-                    log.exception("gemini_to_client error: %s", e)
-                    try: await websocket.send_json({"type": "error", "error": str(e)[:200]})
-                    except Exception: pass
-                    raise
+                    log.warning("gemini_to_browser ended: %s", e)
+                    stop_event.set()
 
-            # Send opener trigger so Gemini speaks first
+            # Kick off the conversation so Gemini greets the user first.
             try:
                 await session.send_client_content(
-                    turns=[{"role": "user", "parts": [{"text": "(Begin our voice session. Greet me by name and gently reference one recent journal theme.)"}]}],
+                    turns=gt.Content(role="user", parts=[gt.Part(text="(Begin our voice session. Greet me warmly by name and gently reference one specific recent journal theme.)")]),
                     turn_complete=True,
                 )
             except Exception:
                 pass
 
-            t1 = asyncio.create_task(client_to_gemini())
-            t2 = asyncio.create_task(gemini_to_client())
-            done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-            for tk in pending:
-                tk.cancel()
+            t_in = asyncio.create_task(browser_to_gemini())
+            t_out = asyncio.create_task(gemini_to_browser())
+            done, pending = await asyncio.wait({t_in, t_out}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+                try: await task
+                except Exception: pass
     except WebSocketDisconnect:
         log.info("voice ws: client disconnected user=%s", user_id)
     except Exception as e:
-        log.exception("voice ws error: %s", e)
-        try: await websocket.send_json({"type": "error", "error": str(e)[:200]})
+        log.exception("voice ws Live session failed")
+        try: await websocket.send_text(json.dumps({"type": "error", "text": str(e)[:200]}))
         except Exception: pass
     finally:
         try: await websocket.close()

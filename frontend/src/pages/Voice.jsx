@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Mic, MicOff, Square, Hand, Radio, Wifi, WifiOff, RotateCcw,
+  Mic, MicOff, Square, Radio, Wifi, WifiOff, RotateCcw,
   Volume2, VolumeX, Activity, AlertCircle,
 } from "lucide-react";
 import AppShell from "../components/AppShell";
@@ -11,7 +11,14 @@ import { toast } from "sonner";
 const BACKEND = process.env.REACT_APP_BACKEND_URL;
 const WS_URL = `${BACKEND.replace(/^http/, "ws")}/api/voice/ws`;
 
-const COMMANDS = ["done", "next", "repeat", "show again", "i'm stuck", "zoom in", "explain slower"];
+const QUICK_PROMPTS = ["Next step", "Repeat that", "I'm stuck", "Slower", "Done", "Show again"];
+
+/** Convert Int16 PCM to playable Float32. */
+function int16ToFloat32(int16) {
+  const f = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f[i] = int16[i] / 0x8000;
+  return f;
+}
 
 const StatusPill = ({ ok, label, icon: Icon }) => (
   <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] border ${
@@ -21,359 +28,366 @@ const StatusPill = ({ ok, label, icon: Icon }) => (
   </div>
 );
 
-const WaveformBars = ({ level = 0, speaking = false }) => {
-  // 24 animated bars driven by mic level + a baseline when assistant speaks
-  const bars = Array.from({ length: 24 });
+const WaveformBars = ({ analyser, speaking, idle }) => {
+  // 24 bars driven by the live AnalyserNode (real frequency data) + assistant pulse
+  const N = 24;
+  const ref = useRef(null);
+  const rafRef = useRef(0);
+  useEffect(() => {
+    let mounted = true;
+    const buf = new Uint8Array(N);
+    const draw = () => {
+      if (!mounted) return;
+      const el = ref.current;
+      if (el) {
+        if (analyser) {
+          try { analyser.getByteFrequencyData(new Uint8Array(analyser.frequencyBinCount).subarray(0, 0)); } catch {}
+          try {
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(data);
+            for (let i = 0; i < N; i++) {
+              const idx = Math.floor((i / N) * data.length);
+              buf[i] = data[idx] || 0;
+            }
+          } catch {}
+        }
+        const bars = el.children;
+        for (let i = 0; i < N; i++) {
+          const v = idle ? 0 : (buf[i] / 255);
+          const phase = (performance.now() / 200 + i * 0.4) % (Math.PI * 2);
+          const wave = speaking ? (0.5 + 0.5 * Math.sin(phase)) : 0;
+          const h = Math.max(0.08, Math.min(1, v * 1.4 + wave * 0.6));
+          if (bars[i]) bars[i].style.height = `${h * 100}%`;
+        }
+      }
+      rafRef.current = requestAnimationFrame(draw);
+    };
+    rafRef.current = requestAnimationFrame(draw);
+    return () => { mounted = false; cancelAnimationFrame(rafRef.current); };
+  }, [analyser, speaking, idle]);
   return (
-    <div className="flex items-end justify-center gap-1 h-16">
-      {bars.map((_, i) => {
-        const phase = (Date.now() / 200 + i * 0.4) % (Math.PI * 2);
-        const wave = speaking ? (0.5 + 0.5 * Math.sin(phase)) : 0;
-        const h = Math.max(0.08, Math.min(1, level * 4 + wave * 0.6 + Math.random() * 0.05));
-        return (
-          <motion.span
-            key={i}
-            animate={{ height: `${h * 100}%` }}
-            transition={{ duration: 0.08 }}
-            className="w-[6px] rounded-full"
-            style={{
-              background: speaking
-                ? `linear-gradient(180deg, #10b981, #14b8a6)`
-                : `linear-gradient(180deg, #ec4899, #a78bfa)`,
-              boxShadow: speaking
-                ? `0 0 8px rgba(16,185,129,${0.4 + h * 0.5})`
-                : `0 0 8px rgba(236,72,153,${0.3 + h * 0.4})`,
-            }}
-          />
-        );
-      })}
+    <div ref={ref} className="flex items-end justify-center gap-1 h-16">
+      {Array.from({ length: N }).map((_, i) => (
+        <span key={i} className="w-[6px] rounded-full" style={{
+          height: "8%",
+          background: speaking
+            ? `linear-gradient(180deg, #10b981, #14b8a6)`
+            : `linear-gradient(180deg, #ec4899, #a78bfa)`,
+          boxShadow: speaking
+            ? `0 0 8px rgba(16,185,129,0.5)`
+            : `0 0 8px rgba(236,72,153,0.4)`,
+          transition: "height 80ms linear",
+        }} />
+      ))}
     </div>
   );
 };
 
 const Voice = () => {
-  const [mode, setMode] = useState("handsfree");  // 'handsfree' | 'ptt'
-  const [connected, setConnected] = useState(false);
-  const [connState, setConnState] = useState("idle"); // idle|connecting|live|reconnecting|error
-  const [permission, setPermission] = useState("unknown");
-  const [listening, setListening] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
+  const [active, setActive] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [connState, setConnState] = useState("idle"); // idle|connecting|connected|reconnecting|error
+  const [status, setStatus] = useState("idle"); // idle|listening|speaking
   const [muted, setMuted] = useState(false);
-  const [level, setLevel] = useState(0);
   const [latencyMs, setLatencyMs] = useState(null);
-  const [captions, setCaptions] = useState([]); // {role, text, t}
+  const [transcript, setTranscript] = useState([]);
   const [error, setError] = useState("");
-  const [devices, setDevices] = useState([]);
-  const [activeDevice, setActiveDevice] = useState("");
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [analyser, setAnalyser] = useState(null);
+  const [micLevel, setMicLevel] = useState(0);
 
   const wsRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const micStreamRef = useRef(null);
-  const micNodeRef = useRef(null);
-  const playNodeRef = useRef(null);
-  const sourceNodeRef = useRef(null);
-  const reconnectTimer = useRef(null);
-  const shouldReconnect = useRef(true);
-  const vadState = useRef({ speaking: false, silenceMs: 0, lastSpeechAt: 0, lastUserTurnAt: 0 });
-  const lastSentAt = useRef(0);
-  const ptt = useRef(false);
+  const ctxInRef = useRef(null);
+  const ctxOutRef = useRef(null);
+  const streamRef = useRef(null);
+  const workletRef = useRef(null);
+  const sourceRef = useRef(null);
+  const analyserRef = useRef(null);
+  const playHeadRef = useRef(0);
+  const playingSourcesRef = useRef([]);
+  const lastChunkAtRef = useRef(0);
+  const userStoppedRef = useRef(false);
+  const reconnectTimerRef = useRef(null);
+  const attemptRef = useRef(0);
+  const mutedRef = useRef(false);
+  const levelRafRef = useRef(0);
 
   /* ---------- token ---------- */
   const token = typeof window !== "undefined" ? localStorage.getItem("ms_token") : "";
 
-  /* ---------- audio init ---------- */
-  const initAudio = useCallback(async () => {
-    if (audioCtxRef.current) return audioCtxRef.current;
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AC({ latencyHint: "interactive" });
-    if (ctx.state === "suspended") await ctx.resume();
-    await ctx.audioWorklet.addModule("/audio-worklets/mic-capture.js");
-    await ctx.audioWorklet.addModule("/audio-worklets/pcm-playback.js");
-    audioCtxRef.current = ctx;
-
-    // Playback node (assistant audio @24kHz → resampled to ctx rate)
-    const playNode = new AudioWorkletNode(ctx, "pcm-playback", {
-      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1],
-      processorOptions: { inSampleRate: 24000 },
-    });
-    playNode.port.onmessage = (e) => {
-      if (e.data?.type === "drained") setSpeaking(false);
-    };
-    playNode.connect(ctx.destination);
-    playNodeRef.current = playNode;
-    return ctx;
+  /* ---------- playback (24kHz scheduled buffer-source pattern) ---------- */
+  const playPCM = useCallback((b64) => {
+    if (mutedRef.current) return;
+    try {
+      if (!ctxOutRef.current) ctxOutRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      const ctx = ctxOutRef.current;
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const aligned = bytes.byteLength % 2 === 0 ? bytes : bytes.slice(0, bytes.byteLength - 1);
+      const int16 = new Int16Array(aligned.buffer, aligned.byteOffset, Math.floor(aligned.byteLength / 2));
+      const f32 = int16ToFloat32(int16);
+      const buf = ctx.createBuffer(1, f32.length, 24000);
+      buf.copyToChannel(f32, 0, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      const now = ctx.currentTime;
+      const startAt = Math.max(now, playHeadRef.current);
+      src.start(startAt);
+      playHeadRef.current = startAt + buf.duration;
+      playingSourcesRef.current.push(src);
+      src.onended = () => {
+        playingSourcesRef.current = playingSourcesRef.current.filter(s => s !== src);
+        if (playingSourcesRef.current.length === 0) setStatus("listening");
+      };
+      setStatus("speaking");
+      lastChunkAtRef.current = performance.now();
+    } catch (e) { console.warn("playPCM err", e); }
   }, []);
 
-  const ensureMic = useCallback(async (deviceId) => {
-    if (micStreamRef.current && !deviceId) return micStreamRef.current;
+  const flushPlayback = useCallback(() => {
+    try { playingSourcesRef.current.forEach(s => { try { s.stop(); } catch {} }); } catch {}
+    playingSourcesRef.current = [];
+    playHeadRef.current = 0;
+  }, []);
+
+  /* ---------- cleanup ---------- */
+  const cleanupMic = useCallback(() => {
+    cancelAnimationFrame(levelRafRef.current);
+    try { workletRef.current?.disconnect?.(); } catch {}
+    try { sourceRef.current?.disconnect?.(); } catch {}
+    try { analyserRef.current?.disconnect?.(); } catch {}
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (ctxInRef.current) {
+      try { ctxInRef.current.close(); } catch {}
+      ctxInRef.current = null;
+    }
+    if (ctxOutRef.current) {
+      try { ctxOutRef.current.close(); } catch {}
+      ctxOutRef.current = null;
+    }
+    playHeadRef.current = 0;
+    playingSourcesRef.current = [];
+    analyserRef.current = null;
+    setAnalyser(null);
+    setMicLevel(0);
+  }, []);
+
+  /* ---------- socket ---------- */
+  const start = useCallback(async (isReconnect = false) => {
+    if (active) return;
+    setConnecting(true);
+    setConnState(isReconnect ? "reconnecting" : "connecting");
+    setError("");
+    userStoppedRef.current = false;
     try {
+      // Mic stream (fresh each start)
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: deviceId ? { exact: deviceId } : undefined,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 48000,
-        },
-        video: false,
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
-      setPermission("granted");
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach(t => t.stop());
-      }
-      micStreamRef.current = stream;
-      // device list
+      streamRef.current = stream;
+
+      const ctxIn = new (window.AudioContext || window.webkitAudioContext)();
+      ctxInRef.current = ctxIn;
       try {
-        const list = await navigator.mediaDevices.enumerateDevices();
-        const ins = list.filter(d => d.kind === "audioinput");
-        setDevices(ins);
-        setActiveDevice(ins[0]?.deviceId || "");
-      } catch {}
-      return stream;
+        await ctxIn.audioWorklet.addModule("/pcm-processor.js");
+      } catch (e) {
+        // Add module may fail if previously loaded; safe to ignore
+      }
+      const source = ctxIn.createMediaStreamSource(stream);
+      sourceRef.current = source;
+      const node = new AudioWorkletNode(ctxIn, "pcm-processor", {
+        processorOptions: { inputSampleRate: ctxIn.sampleRate },
+      });
+      workletRef.current = node;
+
+      const an = ctxIn.createAnalyser();
+      an.fftSize = 1024;
+      source.connect(an);
+      source.connect(node);
+      analyserRef.current = an;
+      setAnalyser(an);
+
+      // rough mic level for header bar
+      const tdata = new Uint8Array(an.frequencyBinCount);
+      const loop = () => {
+        if (!analyserRef.current) return;
+        try {
+          analyserRef.current.getByteTimeDomainData(tdata);
+          let sum = 0;
+          for (let i = 0; i < tdata.length; i++) { const v = (tdata[i] - 128) / 128; sum += v * v; }
+          const rms = Math.sqrt(sum / tdata.length);
+          setMicLevel(rms);
+        } catch {}
+        levelRafRef.current = requestAnimationFrame(loop);
+      };
+      levelRafRef.current = requestAnimationFrame(loop);
+
+      // open WS
+      await new Promise((resolve, reject) => {
+        if (!token) { reject(new Error("Sign in required")); return; }
+        const url = `${WS_URL}?token=${encodeURIComponent(token)}`;
+        const ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
+        wsRef.current = ws;
+        const tmo = setTimeout(() => { try { ws.close(); } catch {} ; reject(new Error("WS timeout")); }, 12000);
+        ws.onopen = () => {
+          clearTimeout(tmo);
+          setConnState("connected");
+          setActive(true);
+          setConnecting(false);
+          setReconnectAttempt(0);
+          attemptRef.current = 0;
+          setStatus("listening");
+          // periodic ping for latency
+          const pingTimer = setInterval(() => {
+            if (ws.readyState !== WebSocket.OPEN) { clearInterval(pingTimer); return; }
+            const t0 = performance.now();
+            ws._pingAt = t0;
+            try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
+          }, 4000);
+          ws._pingTimer = pingTimer;
+          resolve(ws);
+        };
+        ws.onerror = (e) => { clearTimeout(tmo); console.warn("ws error", e); };
+        ws.onmessage = (e) => {
+          try {
+            const m = JSON.parse(e.data);
+            if (m.type === "status") {
+              // 'connecting' | 'connected'
+              return;
+            }
+            if (m.type === "pong") {
+              if (ws._pingAt) setLatencyMs(Math.round(performance.now() - ws._pingAt));
+              return;
+            }
+            if (m.type === "audio_out") {
+              playPCM(m.chunk);
+              if (lastChunkAtRef.current) setLatencyMs(Math.round(performance.now() - lastChunkAtRef.current));
+              return;
+            }
+            if (m.type === "transcript") {
+              setTranscript((p) => [...p.slice(-40), { role: m.role || "model", text: m.text, at: Date.now() }]);
+              return;
+            }
+            if (m.type === "interrupted") {
+              flushPlayback();
+              setStatus("listening");
+              return;
+            }
+            if (m.type === "turn_complete") {
+              if (playingSourcesRef.current.length === 0) setStatus("listening");
+              return;
+            }
+            if (m.type === "error") {
+              setError(m.text || m.error || "stream error");
+              setConnState("error");
+            }
+          } catch {}
+        };
+        ws.onclose = () => {
+          clearInterval(ws._pingTimer);
+          setActive(false);
+          setStatus("idle");
+          if (userStoppedRef.current) { setConnState("idle"); return; }
+          // auto-reconnect with exponential backoff
+          attemptRef.current += 1;
+          setReconnectAttempt(attemptRef.current);
+          if (attemptRef.current <= 5) {
+            setConnState("reconnecting");
+            const delay = Math.min(5000, 400 * Math.pow(2, attemptRef.current - 1));
+            reconnectTimerRef.current = setTimeout(() => {
+              cleanupMic();
+              start(true);
+            }, delay);
+          } else {
+            setConnState("error");
+            setError("Voice connection lost. Click Begin to retry.");
+          }
+        };
+      });
+
+      // pipe mic PCM to backend as audio_in
+      node.port.onmessage = (ev) => {
+        const buf = ev.data;
+        if (!buf || !wsRef.current || wsRef.current.readyState !== 1) return;
+        if (mutedRef.current) return;
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        try { wsRef.current.send(JSON.stringify({ type: "audio_in", chunk: btoa(bin) })); } catch {}
+        lastChunkAtRef.current = performance.now();
+      };
+
+      if (isReconnect) {
+        setTimeout(() => {
+          if (wsRef.current?.readyState === 1) {
+            try { wsRef.current.send(JSON.stringify({ type: "text", text: "Continue where we left off." })); } catch {}
+          }
+        }, 400);
+      }
     } catch (e) {
-      setPermission("denied");
-      throw e;
+      setConnecting(false);
+      setConnState("error");
+      cleanupMic();
+      const msg = e?.name === "NotAllowedError" ? "Microphone permission denied"
+        : e?.message || "Failed to start voice";
+      setError(msg);
+      toast.error(msg);
     }
-  }, []);
+  }, [active, token, playPCM, flushPlayback, cleanupMic]);
 
-  const wireMicNode = useCallback(async () => {
-    const ctx = audioCtxRef.current;
-    const stream = micStreamRef.current;
-    if (!ctx || !stream) return;
-    // tear old
-    try { sourceNodeRef.current?.disconnect(); } catch {}
-    try { micNodeRef.current?.disconnect(); } catch {}
-    const source = ctx.createMediaStreamSource(stream);
-    const mic = new AudioWorkletNode(ctx, "mic-capture", {
-      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
-      processorOptions: { targetSampleRate: 16000 },
-    });
-    mic.port.onmessage = onMicMessage;
-    source.connect(mic);
-    // do NOT connect mic to destination
-    sourceNodeRef.current = source;
-    micNodeRef.current = mic;
-  }, []);
-
-  /* ---------- VAD + send loop ---------- */
-  const onMicMessage = useCallback((e) => {
-    const d = e.data || {};
-    if (d.type === "level") {
-      setLevel(d.rms);
-      const now = performance.now();
-      const speakingNow = d.rms > 0.025;
-      const s = vadState.current;
-      if (mode === "handsfree") {
-        if (speakingNow) {
-          s.lastSpeechAt = now;
-          if (!s.speaking) {
-            s.speaking = true;
-            // user started → interrupt assistant if needed
-            try { playNodeRef.current?.port.postMessage({ type: "flush" }); } catch {}
-            setSpeaking(false);
-            wsSend({ type: "activity_start" });
-          }
-        } else if (s.speaking) {
-          if (now - s.lastSpeechAt > 600) {
-            s.speaking = false;
-            wsSend({ type: "activity_end" });
-          }
-        }
-      }
-      return;
-    }
-    if (d.type === "chunk" && d.pcm) {
-      // send audio (PTT requires ptt=true; handsfree always sends)
-      if (mode === "ptt" && !ptt.current) return;
-      const bytes = new Uint8Array(d.pcm);
-      // base64 encode
-      let bin = ""; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-      const b64 = btoa(bin);
-      wsSend({ type: "audio", data: b64 });
-      lastSentAt.current = performance.now();
-    }
-  }, [mode]);
-
-  /* ---------- websocket ---------- */
-  const wsSend = (obj) => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  };
-
-  const connect = useCallback(() => {
-    if (!token) { setError("Sign in required"); return; }
-    setConnState("connecting"); setError("");
-    const url = `${WS_URL}?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setConnected(true); setConnState("live");
-      setListening(true);
-      // periodic ping for latency
-      const pingTimer = setInterval(() => {
-        if (ws.readyState !== WebSocket.OPEN) { clearInterval(pingTimer); return; }
-        const t0 = performance.now();
-        ws._pingAt = t0;
-        ws.send(JSON.stringify({ type: "ping" }));
-      }, 4000);
-      ws._pingTimer = pingTimer;
-    };
-
-    ws.onmessage = (ev) => {
-      let m;
-      try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.type === "setup_complete") return;
-      if (m.type === "pong") {
-        if (ws._pingAt) setLatencyMs(Math.round(performance.now() - ws._pingAt));
-        return;
-      }
-      if (m.type === "audio" && m.data) {
-        // decode base64 → ArrayBuffer
-        const bin = atob(m.data);
-        const buf = new ArrayBuffer(bin.length);
-        const u8 = new Uint8Array(buf);
-        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        if (!muted && playNodeRef.current) {
-          playNodeRef.current.port.postMessage({ type: "chunk", pcm: buf }, [buf]);
-          setSpeaking(true);
-        }
-        // measure ttf-audio after a user audio chunk was just sent
-        if (lastSentAt.current) {
-          const dt = performance.now() - lastSentAt.current;
-          if (dt < 5000) setLatencyMs(Math.round(dt));
-          lastSentAt.current = 0;
-        }
-        return;
-      }
-      if (m.type === "text" && m.text) {
-        setCaptions((c) => [...c.slice(-30), { role: m.role || "assistant", text: m.text, t: Date.now() }]);
-        // command detection on user transcript
-        if (m.role === "user") {
-          const low = m.text.toLowerCase();
-          if (COMMANDS.some(c => low.includes(c))) {
-            // The assistant will hear & respond — we just flash a UI hint
-            toast.success(`heard command: "${low.match(new RegExp(COMMANDS.join("|")))?.[0]}"`);
-          }
-        }
-        return;
-      }
-      if (m.type === "interrupted") {
-        try { playNodeRef.current?.port.postMessage({ type: "flush" }); } catch {}
-        setSpeaking(false);
-        return;
-      }
-      if (m.type === "turn_complete") {
-        setSpeaking(false);
-        return;
-      }
-      if (m.type === "error") {
-        setError(m.error || "stream error");
-        setConnState("error");
-      }
-    };
-
-    ws.onclose = () => {
-      clearInterval(ws._pingTimer);
-      setConnected(false); setListening(false); setSpeaking(false);
-      if (shouldReconnect.current) {
-        setConnState("reconnecting");
-        clearTimeout(reconnectTimer.current);
-        reconnectTimer.current = setTimeout(() => connect(), 1500);
-      } else {
-        setConnState("idle");
-      }
-    };
-    ws.onerror = () => { /* onclose will follow */ };
-  }, [token, muted]);
-
-  /* ---------- session control ---------- */
-  const startSession = async () => {
-    try {
-      shouldReconnect.current = true;
-      setError("");
-      await initAudio();
-      await ensureMic();
-      await wireMicNode();
-      connect();
-    } catch (e) {
-      setError(e?.message || "could not start");
-      toast.error("Microphone denied or unavailable. Allow mic access.");
-    }
-  };
-
-  const stopSession = () => {
-    shouldReconnect.current = false;
-    clearTimeout(reconnectTimer.current);
+  const stop = useCallback(() => {
+    userStoppedRef.current = true;
+    if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
+    try { wsRef.current?.send(JSON.stringify({ type: "stop" })); } catch {}
     try { wsRef.current?.close(); } catch {}
-    try { playNodeRef.current?.port.postMessage({ type: "flush" }); } catch {}
-    try { micStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
-    micStreamRef.current = null;
-    try { sourceNodeRef.current?.disconnect(); } catch {}
-    try { micNodeRef.current?.disconnect(); } catch {}
-    setConnected(false); setListening(false); setSpeaking(false);
+    wsRef.current = null;
+    cleanupMic();
+    setActive(false);
+    setStatus("idle");
     setConnState("idle");
-    setCaptions([]);
-  };
+    setReconnectAttempt(0);
+    setTranscript([]);
+  }, [cleanupMic]);
 
-  // PTT key handlers (Space) + click handlers
-  useEffect(() => {
-    const down = (e) => {
-      if (mode !== "ptt") return;
-      if (e.code === "Space" && !e.repeat && connected) {
-        e.preventDefault(); ptt.current = true;
-        wsSend({ type: "activity_start" });
-      }
-    };
-    const up = (e) => {
-      if (mode !== "ptt") return;
-      if (e.code === "Space" && connected) {
-        e.preventDefault(); ptt.current = false;
-        wsSend({ type: "activity_end" });
-      }
-    };
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
-  }, [mode, connected]);
+  const sendText = useCallback((text) => {
+    if (!text || wsRef.current?.readyState !== 1) return;
+    try { wsRef.current.send(JSON.stringify({ type: "text", text })); } catch {}
+    setTranscript((p) => [...p, { role: "user", text, at: Date.now() }]);
+  }, []);
 
-  // device switching
-  const switchDevice = async (id) => {
-    setActiveDevice(id);
-    if (!micStreamRef.current) return;
-    await ensureMic(id);
-    await wireMicNode();
-  };
+  /* ---------- effects ---------- */
+  useEffect(() => { mutedRef.current = muted; }, [muted]);
+  useEffect(() => () => stop(), []); // eslint-disable-line
 
-  // mute handling: when muted, stop forwarding mic but keep ws alive
-  useEffect(() => {
-    micNodeRef.current?.port.postMessage({ type: "mute", value: muted });
-  }, [muted]);
-
-  // cleanup on unmount
-  useEffect(() => () => stopSession(), []); // eslint-disable-line
-
-  // SSR autoplay guard
   const isSecure = typeof window !== "undefined" && window.isSecureContext;
   const hasMediaDevices = typeof navigator !== "undefined" && navigator.mediaDevices?.getUserMedia;
+
+  const connected = active && connState === "connected";
+  const speaking = status === "speaking";
+  const listening = active && !speaking;
 
   return (
     <AppShell>
       <PageHeader
         eyebrow="real-time voice · gemini live"
         title="Just talk."
-        subtitle="Hands-free or push-to-talk. Interrupt anytime. Live captions."
+        subtitle="Hands-free mental wellness conversation with Lyra. Interrupt anytime. Live captions."
         accent="#10b981"
         right={
           <div className="flex gap-2 items-center">
             <StatusPill ok={connected} label={
-              connState === "live" ? `live · ${latencyMs ?? "—"}ms` :
+              connState === "connected" ? `live · ${latencyMs ?? "—"}ms` :
               connState === "connecting" ? "connecting" :
-              connState === "reconnecting" ? "reconnecting" :
+              connState === "reconnecting" ? `reconnecting #${reconnectAttempt}` :
               connState === "error" ? "error" : "idle"
             } icon={connected ? Wifi : WifiOff} />
-            <button onClick={() => setMuted(m => !m)} className="px-3 py-2 rounded-full border border-white/10 hover:bg-white/5 flex items-center gap-2 text-xs">
+            <button onClick={() => setMuted(m => !m)} data-testid="voice-mute-toggle" className="px-3 py-2 rounded-full border border-white/10 hover:bg-white/5 flex items-center gap-2 text-xs">
               {muted ? <VolumeX size={12}/> : <Volume2 size={12}/>} {muted ? "muted" : "sound"}
             </button>
           </div>
@@ -391,33 +405,22 @@ const Voice = () => {
         </div>
       )}
       {error && (
-        <div className="glass p-4 mb-4 text-sm text-red-300 border border-red-400/40 flex items-center gap-2">
+        <div className="glass p-4 mb-4 text-sm text-red-300 border border-red-400/40 flex items-center gap-2" data-testid="voice-error">
           <AlertCircle size={14}/> {error}
         </div>
       )}
 
-      {/* Mode + device row */}
+      {/* Mode / mic level row */}
       <div className="flex flex-wrap gap-2 mb-4">
         <div className="glass px-3 py-1.5 flex gap-1 items-center" style={{ borderRadius: 999 }}>
-          <button onClick={() => setMode("handsfree")} data-testid="voice-mode-handsfree"
-            className={`px-3 py-1 rounded-full text-xs flex items-center gap-1 transition ${mode === "handsfree" ? "bg-emerald-500/20 text-emerald-300" : "text-white/50 hover:text-white"}`}>
-            <Radio size={11}/> hands-free
-          </button>
-          <button onClick={() => setMode("ptt")} data-testid="voice-mode-ptt"
-            className={`px-3 py-1 rounded-full text-xs flex items-center gap-1 transition ${mode === "ptt" ? "bg-purple-500/20 text-purple-300" : "text-white/50 hover:text-white"}`}>
-            <Hand size={11}/> push-to-talk (hold space)
-          </button>
+          <span className="px-3 py-1 rounded-full text-xs flex items-center gap-1 bg-emerald-500/20 text-emerald-300">
+            <Radio size={11}/> hands-free · gemini live
+          </span>
         </div>
-        {devices.length > 1 && (
-          <select value={activeDevice} onChange={(e) => switchDevice(e.target.value)} data-testid="voice-device"
-            className="glass px-3 py-2 text-xs outline-none" style={{ borderRadius: 999 }}>
-            {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || "Microphone"}</option>)}
-          </select>
-        )}
         <div className="glass px-3 py-1.5 flex items-center gap-2 text-xs text-white/60" style={{ borderRadius: 999 }}>
           <Activity size={11} className="text-pink-400"/>
           <div className="w-24 h-1.5 bg-white/10 rounded-full overflow-hidden">
-            <div className="h-full" style={{ width: `${Math.min(100, level * 600)}%`, background: "linear-gradient(90deg,#ec4899,#a78bfa)" }} />
+            <div className="h-full" style={{ width: `${Math.min(100, micLevel * 600)}%`, background: "linear-gradient(90deg,#ec4899,#a78bfa)" }} />
           </div>
           <span>mic</span>
         </div>
@@ -428,66 +431,61 @@ const Voice = () => {
         <div className="flex-1 flex flex-col items-center justify-center gap-6 py-10">
           <motion.div
             animate={{
-              scale: speaking ? [1, 1.08, 1] : 1 + Math.min(0.18, level * 4),
+              scale: speaking ? [1, 1.08, 1] : 1 + Math.min(0.18, micLevel * 4),
               boxShadow: speaking
                 ? "0 0 160px 50px rgba(16,185,129,0.55)"
                 : listening
-                ? `0 0 ${80 + level * 800}px ${20 + level * 200}px rgba(236,72,153,${0.4 + level * 2})`
+                ? `0 0 ${80 + micLevel * 800}px ${20 + micLevel * 200}px rgba(236,72,153,${0.4 + micLevel * 2})`
                 : "0 0 60px 15px rgba(167,139,250,0.35)",
             }}
             transition={{ duration: speaking ? 0.9 : 0.06, ease: "easeInOut", repeat: speaking ? Infinity : 0 }}
             className="mind-orb"
             style={{ width: 240, height: 240 }}
           />
-          <WaveformBars level={level} speaking={speaking} />
+          <WaveformBars analyser={analyser} speaking={speaking} idle={!active} />
           <div className="text-[11px] uppercase tracking-[0.3em]" style={{ color: speaking ? "#10b981" : listening ? "#ec4899" : "#a78bfa" }}>
-            {speaking ? "lyra speaking…" : listening ? (mode === "ptt" ? "hold SPACE to talk" : "listening") : connState === "reconnecting" ? "reconnecting…" : "ready"}
+            {speaking ? "lyra speaking…" : listening ? "listening" : connState === "reconnecting" ? "reconnecting…" : connState === "connecting" ? "connecting…" : "ready"}
           </div>
           <div className="flex gap-3">
-            {!connected ? (
-              <button onClick={startSession} data-testid="voice-start"
-                className="btn-pulse flex items-center gap-2 px-7 py-3.5 rounded-full bg-white text-black font-medium hover:scale-[1.03] transition">
-                <Mic size={16}/> Begin conversation
+            {!active ? (
+              <button onClick={() => start(false)} disabled={connecting} data-testid="voice-start"
+                className="btn-pulse flex items-center gap-2 px-7 py-3.5 rounded-full bg-white text-black font-medium hover:scale-[1.03] transition disabled:opacity-50">
+                <Mic size={16}/> {connecting ? "Connecting…" : "Begin conversation"}
               </button>
             ) : (
               <>
-                {mode === "ptt" && (
-                  <button
-                    onMouseDown={() => { ptt.current = true; wsSend({ type: "activity_start" }); }}
-                    onMouseUp={() => { ptt.current = false; wsSend({ type: "activity_end" }); }}
-                    onMouseLeave={() => { if (ptt.current) { ptt.current = false; wsSend({ type: "activity_end" }); } }}
-                    onTouchStart={(e) => { e.preventDefault(); ptt.current = true; wsSend({ type: "activity_start" }); }}
-                    onTouchEnd={(e) => { e.preventDefault(); ptt.current = false; wsSend({ type: "activity_end" }); }}
-                    data-testid="voice-ptt-button"
-                    className={`select-none flex items-center gap-2 px-7 py-3.5 rounded-full font-medium transition ${ptt.current ? "bg-pink-500 text-white scale-105" : "bg-white text-black hover:scale-[1.03]"}`}>
-                    {ptt.current ? <MicOff size={16}/> : <Mic size={16}/>} {ptt.current ? "talking…" : "hold to talk"}
-                  </button>
-                )}
-                <button onClick={stopSession} data-testid="voice-stop"
+                <button onClick={stop} data-testid="voice-stop"
                   className="flex items-center gap-2 px-6 py-3 rounded-full border border-white/15 hover:bg-white/5">
                   <Square size={14}/> end
                 </button>
-                <button onClick={() => { try { playNodeRef.current?.port.postMessage({ type: "flush" }); } catch{} setSpeaking(false); wsSend({ type: "activity_start" }); setTimeout(() => wsSend({ type: "activity_end" }), 50); }}
+                <button onClick={() => { flushPlayback(); setStatus("listening"); }}
+                  data-testid="voice-interrupt"
                   className="flex items-center gap-2 px-5 py-3 rounded-full border border-white/10 hover:bg-white/5 text-sm" title="Interrupt assistant">
                   <RotateCcw size={13}/> interrupt
                 </button>
               </>
             )}
           </div>
-          <div className="flex flex-wrap gap-2 justify-center text-[10px] text-white/40 max-w-xl text-center">
-            try saying: {COMMANDS.map((c, i) => <span key={c} className="px-2 py-0.5 rounded-full bg-white/5">"{c}"</span>)}
+          <div className="flex flex-wrap gap-2 justify-center text-[10px] text-white/50 max-w-xl text-center">
+            <span className="text-white/40 mr-2 uppercase tracking-widest">quick prompts:</span>
+            {QUICK_PROMPTS.map((c) => (
+              <button key={c} onClick={() => sendText(c)} disabled={!active} data-testid={`voice-quick-${c.toLowerCase().replace(/\s+/g, "-").replace("'", "")}`}
+                className="px-2.5 py-1 rounded-full bg-white/5 hover:bg-emerald-500/10 hover:text-emerald-300 border border-white/10 text-white/70 disabled:opacity-40 transition">
+                "{c}"
+              </button>
+            ))}
           </div>
         </div>
 
         {/* live captions */}
         <div className="border-t border-white/5 px-5 py-4 max-h-56 overflow-y-auto bg-black/30" data-testid="voice-captions">
           <div className="text-xs uppercase tracking-widest text-white/40 mb-2">live captions</div>
-          {captions.length === 0 ? (
+          {transcript.length === 0 ? (
             <div className="text-sm text-white/40">Captions appear as you and Lyra speak.</div>
           ) : (
             <AnimatePresence initial={false}>
-              {captions.slice(-10).map((c, i) => (
-                <motion.div key={`${c.t}-${i}`} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+              {transcript.slice(-10).map((c, i) => (
+                <motion.div key={`${c.at}-${i}`} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
                   className={`text-sm mb-1 ${c.role === "user" ? "text-white" : "text-emerald-300"}`}>
                   <span className="text-[10px] uppercase tracking-widest mr-2 opacity-50">{c.role === "user" ? "you" : "lyra"}</span>{c.text}
                 </motion.div>

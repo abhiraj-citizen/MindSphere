@@ -98,7 +98,6 @@ body {
   backdrop-filter: blur(24px) saturate(140%);
   -webkit-backdrop-filter: blur(24px) saturate(140%);
   border-radius: 24px;
-  position: relative;
 }
 
 .glass-hover {
