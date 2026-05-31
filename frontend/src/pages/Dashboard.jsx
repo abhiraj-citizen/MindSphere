@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { useNavigate } from "react-router-dom";
 import {
@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import AppShell from "../components/AppShell";
 import { PageHeader, Card } from "../components/Shared";
+import TutorialOverlay from "../components/TutorialOverlay";
 import { http } from "../lib/api";
 import { useAuth } from "../lib/auth.jsx";
 import { toast } from "sonner";
@@ -55,6 +56,7 @@ const Dashboard = () => {
   const [verse, setVerse] = useState(null);
   const [hydrating, setHydrating] = useState(false);
   const [grat, setGrat] = useState("");
+  const [showTutorial, setShowTutorial] = useState(false);
   const nav = useNavigate();
 
   const load = async () => {
@@ -64,6 +66,19 @@ const Dashboard = () => {
     } catch (e) { toast.error("Could not load dashboard"); }
   };
   useEffect(() => { load(); }, []);
+
+  // Auto-launch tutorial for newly-onboarded users on their very first dashboard visit.
+  // We deliberately do NOT return a cleanup that cancels the timeout: React 18 StrictMode
+  // double-invokes effects in dev, and a cleanup-based cancel would prevent the tour
+  // from ever opening. The `tutorialKickedRef` guards against duplicate scheduling.
+  const tutorialKickedRef = useRef(false);
+  useEffect(() => {
+    if (!user || tutorialKickedRef.current) return;
+    if (user.onboarded && user.tutorial_completed === false) {
+      tutorialKickedRef.current = true;
+      setTimeout(() => setShowTutorial(true), 600);
+    }
+  }, [user]);
 
   const drinkWater = async () => {
     setHydrating(true);
@@ -253,6 +268,10 @@ const Dashboard = () => {
           </div>
         </Card>
       </div>
+      <TutorialOverlay
+        open={showTutorial}
+        onClose={() => setShowTutorial(false)}
+      />
     </AppShell>
   );
 };

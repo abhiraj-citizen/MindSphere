@@ -14,6 +14,15 @@
 - Mental wellness seekers wanting journaling, mood tracking, AI companion (Lyra), real-time voice conversations, assessments, sleep, diet, meditation
 
 ## Session History
+### 2026-05-31 — Feature: Interactive First-Run Tutorial
+- **Added: Step-by-step tutorial for newly onboarded users**
+  - Backend: added `tutorial_completed` flag to user model (default `False` on signup, `True` for demo user); endpoints `POST /api/users/tutorial-complete` and `POST /api/users/tutorial-reset`.
+  - Frontend: new `TutorialOverlay.jsx` — lightweight custom guided tour (no external library). Spotlights real sidebar nav items using `data-testid` selectors, with a 4-panel dimmer + glowing ring around the target and a glass tooltip card showing title/body/Back/Next/Skip + animated progress dots. Supports keyboard nav (Esc/←/→/Enter).
+  - 9 steps: Welcome → Dashboard → Mind Journal → Mood Tracker → Meet Lyra → Real-Time Voice → Mental Health Tools → Analytics & Insights → You're ready.
+  - Auto-launches in `Dashboard.jsx` when `user.onboarded && user.tutorial_completed === false`. Uses a `useRef` guard to be StrictMode-safe (a `setTimeout` without a cleanup cancel).
+  - Added a **Replay the tour** card in `Settings.jsx` — calls `/users/tutorial-reset`, refreshes auth, navigates to dashboard so the auto-trigger fires.
+  - Verified end-to-end via Playwright: tour opens automatically post-onboarding, all 9 steps render in order, Back/Next/Skip work, server marks `tutorial_completed=true`, reload does NOT re-trigger, replay from Settings works.
+
 ### 2026-05-30 — Bug Fixes
 - **Fixed: Dashboard "big gap" bug (P0)**
   - Root cause: `.glass { position: relative; }` in `index.css` overrode the Tailwind `fixed` class on `<Sidebar>` `<aside class="glass fixed ...">`. The sidebar rendered relatively in flow at 851px height, pushing `<main>` down by ~851px on every authenticated page.

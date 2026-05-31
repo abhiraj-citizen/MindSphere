@@ -1,5 +1,7 @@
 import React, { useState } from "react";
 import { motion } from "framer-motion";
+import { useNavigate } from "react-router-dom";
+import { Sparkles } from "lucide-react";
 import AppShell from "../components/AppShell";
 import { PageHeader, Card } from "../components/Shared";
 import { useAuth } from "../lib/auth.jsx";
@@ -8,9 +10,17 @@ import { toast } from "sonner";
 
 const Settings = () => {
   const { user, refresh, logout } = useAuth();
+  const nav = useNavigate();
   const [name, setName] = useState(user?.name || "");
   const [prefs, setPrefs] = useState(user?.preferences || {});
   const [notif, setNotif] = useState({ morning: true, assess: true, appt: true, water: false });
+
+  const startReplay = async () => {
+    try { await http.post("/users/tutorial-reset"); } catch {}
+    await refresh();
+    toast.success("Replaying the tour…");
+    nav("/app/dashboard");
+  };
 
   const savePrefs = async (p) => {
     setPrefs(p);
@@ -95,6 +105,15 @@ const Settings = () => {
           <div className="text-xs uppercase tracking-widest text-white/40 mb-3">privacy & data</div>
           <button onClick={exportData} data-testid="set-export" className="px-5 py-2.5 rounded-full border border-white/10 hover:bg-white/5 text-sm mr-3">Export all data (JSON)</button>
           <button onClick={logout} className="px-5 py-2.5 rounded-full border border-red-400/30 hover:bg-red-500/10 text-sm text-red-300">Sign out</button>
+        </Card>
+
+        <Card>
+          <div className="text-xs uppercase tracking-widest text-white/40 mb-3">guided tour</div>
+          <div className="text-sm text-white/70 mb-3">Forgot what's where? Replay the interactive walkthrough of MindSphere's key features.</div>
+          <button onClick={startReplay} data-testid="set-replay-tutorial"
+            className="px-5 py-2.5 rounded-full bg-white text-black text-sm font-medium flex items-center gap-2 hover:scale-[1.02] transition">
+            <Sparkles size={14}/> Replay the tour
+          </button>
         </Card>
 
         <Card>

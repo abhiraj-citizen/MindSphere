@@ -234,6 +234,7 @@ async def register(req: RegisterReq):
         "avatar": None,
         "onboarded": False,
         "onboarding": {},
+        "tutorial_completed": False,
         "preferences": {"lyra_name": "Lyra", "voice": "alloy", "style": "warm", "accent": "purple"},
         "created_at": now_iso(),
     }
@@ -266,6 +267,25 @@ async def save_onboarding(req: OnboardingReq, user=Depends(current_user)):
     await db.users.update_one(
         {"id": user["id"]},
         {"$set": {"onboarding": req.answers, "onboarded": True, "onboarded_at": now_iso()}},
+    )
+    return {"ok": True}
+
+
+@api.post("/users/tutorial-complete")
+async def complete_tutorial(user=Depends(current_user)):
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"tutorial_completed": True, "tutorial_completed_at": now_iso()}},
+    )
+    return {"ok": True}
+
+
+@api.post("/users/tutorial-reset")
+async def reset_tutorial(user=Depends(current_user)):
+    """Lets a user re-run the tutorial from Settings."""
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"tutorial_completed": False}, "$unset": {"tutorial_completed_at": ""}},
     )
     return {"ok": True}
 
@@ -1526,6 +1546,7 @@ async def seed_demo():
     user = {
         "id": uid, "name": "Aria Demo", "email": "demo@mindsphere.app",
         "password": hash_pw("demo1234"), "avatar": None, "onboarded": True,
+        "tutorial_completed": True,
         "onboarding": {
             "primary_goal": "Improve mood", "current_state": 6,
             "stressors": ["Work", "Finances"], "sleep_hours": 7, "exercise_freq": "1-2x week",
